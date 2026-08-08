@@ -23,6 +23,8 @@ from youtube_transcript_api import (
 import validators
 import yt_dlp
 import json
+import tempfile
+import glob
 
 from flask_cors import CORS
 from googlesearch import search
@@ -362,6 +364,65 @@ def fetch_youtube_transcript_ytdlp(video_id):
         return text, lang
 
 
+GROQ_TRANSCRIPTION_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+# Groq's Whisper endpoint rejects files above this size — checked after download
+# so we fail with a clear message instead of a doomed multi-minute upload.
+MAX_AUDIO_BYTES = 25 * 1024 * 1024  # 25 MB
+
+
+def fetch_youtube_transcript_via_audio(video_id):
+    """Last-resort transcript source: downloads just the audio track — a
+    heavily-used, first-class yt-dlp feature, far sturdier than its caption-
+    scraping path — and transcribes it with Groq's Whisper API (the same model
+    already used for the /audio upload endpoint). This works on videos with no
+    captions at all and doesn't touch YouTube's fragile, rate-limited caption
+    endpoint, so it's tried only after both caption-based sources fail — it
+    costs real time and API usage per call. Returns (transcript_text, language).
+    """
+    if not os.environ.get('GROQ_API_KEY'):
+        raise RuntimeError("GROQ_API_KEY is not configured")
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "noprogress": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        files = [f for f in glob.glob(os.path.join(tmpdir, "*")) if os.path.isfile(f)]
+        if not files:
+            raise RuntimeError("yt-dlp did not produce an audio file")
+        audio_path = max(files, key=os.path.getsize)
+
+        size = os.path.getsize(audio_path)
+        if size > MAX_AUDIO_BYTES:
+            raise RuntimeError(
+                f"Audio track is too large to transcribe ({size / 1024 / 1024:.1f} MB, "
+                f"limit {MAX_AUDIO_BYTES / 1024 / 1024:.0f} MB)"
+            )
+
+        with open(audio_path, "rb") as f:
+            response = requests.post(
+                GROQ_TRANSCRIPTION_URL,
+                headers={"Authorization": f"Bearer {os.environ.get('GROQ_API_KEY')}"},
+                files={"file": (os.path.basename(audio_path), f)},
+                data={"model": "whisper-large-v3-turbo", "response_format": "verbose_json"},
+                timeout=180,
+            )
+        response.raise_for_status()
+        result = response.json()
+        text = (result.get("text") or "").strip()
+        if not text:
+            raise RuntimeError("Whisper returned an empty transcript")
+        return text, result.get("language")
+
+
 @app.route('/summarize-video', methods=['POST'])
 def summarize_video():
     data = request.get_json(silent=True)
@@ -382,15 +443,28 @@ def summarize_video():
             transcript_text, source_lang, _ = fetch_youtube_transcript(video_id)
             app.logger.info(f"Transcript fetched via youtube_transcript_api: {len(transcript_text)} chars, source language '{source_lang}'")
         except Exception as primary_error:
-            app.logger.warning(f"youtube_transcript_api failed ({type(primary_error).__name__}: {primary_error}); trying yt-dlp fallback")
+            app.logger.warning(f"youtube_transcript_api failed ({type(primary_error).__name__}: {primary_error}); trying yt-dlp caption fallback")
             try:
                 transcript_text, source_lang = fetch_youtube_transcript_ytdlp(video_id)
-                app.logger.info(f"Transcript fetched via yt-dlp fallback: {len(transcript_text)} chars, source language '{source_lang}'")
-            except Exception as fallback_error:
-                app.logger.warning(f"yt-dlp fallback also failed: {fallback_error}")
-                # Surface the primary source's error, since its exception types map to
-                # specific, honest messages below — yt-dlp's are just generic failures.
-                raise primary_error
+                app.logger.info(f"Transcript fetched via yt-dlp captions: {len(transcript_text)} chars, source language '{source_lang}'")
+            except Exception as caption_fallback_error:
+                app.logger.warning(f"yt-dlp caption fallback failed ({caption_fallback_error}); trying audio+Whisper fallback")
+                try:
+                    transcript_text, source_lang = fetch_youtube_transcript_via_audio(video_id)
+                    app.logger.info(f"Transcript fetched via audio+Whisper: {len(transcript_text)} chars, detected language '{source_lang}'")
+                except Exception as audio_fallback_error:
+                    app.logger.warning(f"Audio+Whisper fallback also failed: {audio_fallback_error}")
+                    # If the video genuinely has no captions/is unavailable, that's
+                    # still the clearest thing to tell the user even though audio
+                    # also failed (its failure is usually a symptom of the same
+                    # underlying issue). Otherwise, the caption failure reason
+                    # (e.g. "rate limited") is no longer the real story once audio
+                    # has failed for its own, different reason — say so honestly.
+                    if isinstance(primary_error, (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, VideoUnplayable, AgeRestricted, InvalidVideoId)):
+                        raise primary_error
+                    raise RuntimeError(
+                        f"All transcript sources failed. Captions: {primary_error}. Audio transcription: {audio_fallback_error}"
+                    )
     except TranscriptsDisabled:
         return jsonify({"error": "no_captions", "message": "Captions are disabled for this video, so it can't be summarized."}), 404
     except NoTranscriptFound:
